@@ -10,7 +10,7 @@ def main():
     PASSWORD = 'password_here'
     CLIENT_ID = 'client_id_here'
     CLIENT_SECRET = 'client_secret_here'
-    USER_AGENT = 'your_user_agent"
+    USER_AGENT = 'your_user_agent'
 
     logging.basicConfig()
 
