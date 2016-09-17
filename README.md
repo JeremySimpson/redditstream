@@ -1,6 +1,12 @@
 # redditstream
 Simple python class to help stream listings
 
+Reqirements
+----------
+The only requirement is the `requests` library.
+
+Run `pip install requests` to install.
+
 Usage
 ----
 1. Register a `script` type app under your account as described in reddit's API docs.
