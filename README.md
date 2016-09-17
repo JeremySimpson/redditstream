@@ -1,7 +1,7 @@
 # redditstream
 Simple python class to help stream listings
 
-Reqirements
+Requirements
 ----------
 The only requirement is the `requests` library.
 
