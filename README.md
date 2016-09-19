@@ -1,5 +1,5 @@
 # redditstream
-Simple python class to help stream listings
+Simple python class to help stream reddit listings
 
 Requirements
 ----------
