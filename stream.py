@@ -1,5 +1,6 @@
 import logging
 import time
+import json
 
 import requests
 import requests.auth
@@ -23,9 +24,10 @@ class RedditStream(object):
         self.client_id = client_id
         self.client_secret = client_secret
         self.user_agent = user_agent
+        self.log_verbose = log_verbose
         self.access_token = None
         self.expires = -1
-        self.log_verbose = log_verbose
+        self.latest_before = None
 
     def _update_access_token(self):
         # Fetch access token
@@ -52,7 +54,7 @@ class RedditStream(object):
                 'Could not retrieve access token: Json error: {error}'.format(error=response_json['error'])
             )
 
-        logger.info('Setting access token: ' + str(response_json))
+        logger.info('Setting access token: ' + json.dumps(response_json))
         self.access_token = response_json['access_token']
         self.expires = time.time() + int(response_json['expires_in']) * 0.9
 
@@ -91,48 +93,59 @@ class RedditStream(object):
             'Reset': response.headers['X-Ratelimit-Reset']
         }
         if self.log_verbose:
-            logger.info('Response Headers: ' + str(response_headers))
+            logger.info('Response Headers: ' + json.dumps(response_headers))
         return response_json, response_headers
 
-    def stream_listing(self, url):
+    def reset_stream(self):
+        self.access_token = None
+        self.expires = -1
+        self.latest_before = None
+
+    def stream_listing(self, url, concurrency_level=1, extra_delay=0.0):
         """
         Returns a generator representing a listing of the objects at the given url.
-        Attempts to return only new objects, but this is not guaranteed.
+        Attempts to return only new objects, from oldest to newest, but there may be duplicates sometimes.
         Follows the api guidelines by monitoring the RateLimit Headers.
+        Caches the `before` value, so if the stream needs to be resumed, it is possible.
+        This class's functions cannot be run concurrently. One instance per stream please.
         :param url: The url. Must be a listing url.
+        :param concurrency_level: The concurrency level. Set to the number of concurrent streams using the same account.
+        :param extra_delay: The additional delay to have for each request (in seconds).
         :return: A generator.
         """
-        before = None
-        before_int = 0
         session = requests.Session()
         while True:
             try:
                 request_time_start = time.time()
                 response_json, response_headers = self._get_raw_listing(url, limit=STREAM_LIMIT_PER_FETCH,
-                                                                        before=before, after=None, session=session)
+                                                                        before=self.latest_before, after=None,
+                                                                        session=session)
                 request_time_end = time.time()
                 data = response_json['data']
                 children = data['children']
+                if self.log_verbose:
+                    logger.info('Found entries: ' + str(len(children)))
                 if len(children) == STREAM_LIMIT_PER_FETCH:
                     logger.warn(
-                        'Fetched {c} elements. Possible object loss since previous request.'.format(
+                        'Fetched max ({c}) elements. Possible stream lag.'.format(
                             c=STREAM_LIMIT_PER_FETCH)
                     )
                 process_time_start = time.time()
-                for child in children:
+                # Send off each object to be processed
+                # We sort it because we want to process oldest to newest
+                sorted_children = sorted(children, key=lambda c: c['data']['id'])
+                for child in sorted_children:
                     d = child['data']
-                    thing_id_int = int(d['id'], 36)
-                    if thing_id_int > before_int:
-                        before = child['kind'] + '_' + d['id']
-                        before_int = thing_id_int
                     yield d
+                    # Increment the `before` value if we processed the object without problem
+                    self.latest_before = d['name']
                 process_time_end = time.time()
                 rl_reset_time = float(response_headers['Reset'])
                 rl_remaining = float(response_headers['Remaining'])
-                rl_sleep = rl_reset_time if rl_remaining == 0 else (rl_reset_time / rl_remaining)
+                rl_sleep = rl_reset_time if rl_remaining == 0 else ((rl_reset_time / rl_remaining) * concurrency_level)
                 process_time = process_time_end - process_time_start
                 request_time = request_time_end - request_time_start
-                t_sleep = max(rl_sleep - process_time - request_time, 0)
+                t_sleep = max(rl_sleep - process_time - request_time, 0) + extra_delay
                 if self.log_verbose:
                     logger.info(
                         'Reset_t: {}\tRemaining: {}\tCalc Sleep_t: {}\tProcess_t: {}\tRequest_t: {}\tFinal Sleep_t: {}'.format(
@@ -140,6 +153,6 @@ class RedditStream(object):
                     )
                 time.sleep(t_sleep)
             except (StreamException, requests.exceptions.RequestException) as ex:
-                logger.error(ex)
-                logger.warn("Caught Exception - Waiting 2 seconds before continuing")
-                time.sleep(2)
+                logger.exception(ex)
+                logger.warn("Caught StreamException - Waiting 2 seconds before continuing")
+                time.sleep(2.0)
