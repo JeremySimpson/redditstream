@@ -3,9 +3,7 @@ Simple python class to help stream reddit listings
 
 Requirements
 ----------
-The only requirement is the `requests` library.
-
-Run `pip install requests` to install.
+Run `pip install -r requirements.txt` to install.
 
 Usage
 ----
