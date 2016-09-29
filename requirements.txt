@@ -1,0 +1,3 @@
+requests>=2.11.1
+ujson>=1.35
+pylru>=1.0.9
