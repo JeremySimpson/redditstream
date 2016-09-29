@@ -1,7 +1,8 @@
 import logging
 import time
-import json
 
+import ujson
+import pylru
 import requests
 import requests.auth
 import requests.exceptions
@@ -11,6 +12,10 @@ logger.setLevel(logging.INFO)
 
 OAUTH_ACCESS_TOKEN_URL = 'https://www.reddit.com/api/v1/access_token'
 STREAM_LIMIT_PER_FETCH = 100
+BACKOFF_START = 2.0
+BACKOFF_INCREASE_FACTOR = 2
+BACKOFF_MAX = 8.0
+LRU_CACHE_SIZE = 200
 
 
 class StreamException(Exception):
@@ -54,7 +59,7 @@ class RedditStream(object):
                 'Could not retrieve access token: Json error: {error}'.format(error=response_json['error'])
             )
 
-        logger.info('Setting access token: ' + json.dumps(response_json))
+        logger.info('Setting access token: ' + ujson.dumps(response_json))
         self.access_token = response_json['access_token']
         self.expires = time.time() + int(response_json['expires_in']) * 0.9
 
@@ -93,7 +98,7 @@ class RedditStream(object):
             'Reset': response.headers['X-Ratelimit-Reset']
         }
         if self.log_verbose:
-            logger.info('Response Headers: ' + json.dumps(response_headers))
+            logger.info('Response Headers: ' + ujson.dumps(response_headers))
         return response_json, response_headers
 
     def reset_stream(self):
@@ -114,13 +119,20 @@ class RedditStream(object):
         :return: A generator.
         """
         session = requests.Session()
+        cache = pylru.lrucache(LRU_CACHE_SIZE)
+        backoff = BACKOFF_START
         while True:
             try:
-                request_time_start = time.time()
-                response_json, response_headers = self._get_raw_listing(url, limit=STREAM_LIMIT_PER_FETCH,
-                                                                        before=self.latest_before, after=None,
-                                                                        session=session)
-                request_time_end = time.time()
+                time_start = time.time()
+
+                # Get data
+                try:
+                    response_json, response_headers = self._get_raw_listing(
+                        url=url, limit=STREAM_LIMIT_PER_FETCH, before=self.latest_before, after=None, session=session
+                    )
+                except requests.exceptions.RequestException as ex:
+                    raise StreamException(ex)
+
                 data = response_json['data']
                 children = data['children']
                 if self.log_verbose:
@@ -130,29 +142,47 @@ class RedditStream(object):
                         'Fetched max ({c}) elements. Possible stream lag.'.format(
                             c=STREAM_LIMIT_PER_FETCH)
                     )
-                process_time_start = time.time()
                 # Send off each object to be processed
                 # We sort it because we want to process oldest to newest
-                sorted_children = sorted(children, key=lambda c: c['data']['id'])
-                for child in sorted_children:
+                sorted_children = sorted(children, key=lambda c: int(c['data']['id'], 36))
+                for count, child in enumerate(sorted_children):
                     d = child['data']
-                    yield d
+                    fullname = d['name']
+                    if fullname not in cache:
+                        yield d
+                    cache[fullname] = 1
                     # Increment the `before` value if we processed the object without problem
-                    self.latest_before = d['name']
-                process_time_end = time.time()
+                    # Only increment if it isn't the last iteration
+                    # This is so that we always try to have at least one object the next time we request something
+                    if count != len(children) - 1:
+                        self.latest_before = fullname
+                # If there were no children in the response, then we have either made a logic mistake, the page is
+                # no longer valid (no longer cached), or there really are (currently) no more objects.
+                # reset latest_before back to None
+                if len(children) == 0:
+                    logger.warn(
+                        'Fetched zero entries. Possible invalid request. Setting latest_before=None'
+                    )
+                    self.latest_before = None
+                # Calculate sleep time
+                # Then sleep for that amount
                 rl_reset_time = float(response_headers['Reset'])
                 rl_remaining = float(response_headers['Remaining'])
                 rl_sleep = rl_reset_time if rl_remaining == 0 else ((rl_reset_time / rl_remaining) * concurrency_level)
-                process_time = process_time_end - process_time_start
-                request_time = request_time_end - request_time_start
-                t_sleep = max(rl_sleep - process_time - request_time, 0) + extra_delay
+                process_time = time.time() - time_start
+                t_sleep = max(rl_sleep - process_time, 0) + extra_delay
                 if self.log_verbose:
                     logger.info(
-                        'Reset_t: {}\tRemaining: {}\tCalc Sleep_t: {}\tProcess_t: {}\tRequest_t: {}\tFinal Sleep_t: {}'.format(
-                            rl_reset_time, rl_remaining, rl_sleep, process_time, request_time, t_sleep)
+                        'Reset_t: {}\tRemaining: {}\tCalc Sleep_t: {}\tProcess_t: {}\tFinal Sleep_t: {}'.format(
+                            rl_reset_time, rl_remaining, rl_sleep, process_time, t_sleep)
                     )
                 time.sleep(t_sleep)
-            except (StreamException, requests.exceptions.RequestException) as ex:
+            except StreamException as ex:
                 logger.exception(ex)
-                logger.warn("Caught StreamException - Waiting 2 seconds before continuing")
-                time.sleep(2.0)
+                logger.warn(
+                    "Caught StreamException - Waiting {backoff} seconds before continuing".format(backoff=backoff)
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * BACKOFF_INCREASE_FACTOR, BACKOFF_MAX)
+            else:
+                backoff = BACKOFF_START  # Reset backoff back to the starting value
